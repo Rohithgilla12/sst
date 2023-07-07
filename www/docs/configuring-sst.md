@@ -91,6 +91,7 @@ Here's the full list of config options that can be returned:
   - **`fileAssetPublishingRoleArn`** IAM role used to publish file assets to the S3 bucket
   - **`imageAssetPublishingRoleArn`** IAM role used to publish image assets to the ECR repository
   - **`cloudFormationExecutionRole`** IAM role assumed by the CloudFormation to deploy
+  - **`pathMetadata`** Add CDK path metadata to templates. This enables the CDK Construct tree view in the CloudFormation console. Default `false`.
 - **`bootstrap`**
   - **`stackName`** The name to use for the bootstrap stack
   - **`tags`** Tags to use for the bootstrap stack
@@ -101,7 +102,7 @@ Here's the full list of config options that can be returned:
 
 ## Stacks function
 
-The `stacks` function is the entry point for you SST application. This is where you can specify the stacks that contain the resources that you want to deploy.
+The `stacks` function is the entry point for your SST application. This is where you can specify the stacks that contain the resources that you want to deploy.
 
 You can either do this inline, like so.
 

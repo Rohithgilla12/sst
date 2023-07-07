@@ -1,4 +1,4 @@
-import { test, expect, beforeEach, beforeAll } from "vitest";
+import { test, expect } from "vitest";
 /* eslint-disable @typescript-eslint/ban-ts-comment, @typescript-eslint/ban-types, @typescript-eslint/no-empty-function */
 
 import path from "path";
@@ -9,6 +9,8 @@ import {
   stringLike,
   ABSENT,
   createApp,
+  objectLike,
+  ANY,
 } from "./helper";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
@@ -18,10 +20,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as apig from "@aws-cdk/aws-apigatewayv2-alpha";
 import {
   Api,
-  AppSyncApi,
   WebSocketApi,
-  ApiGatewayV1Api,
-  App,
   Job,
   RDS,
   Stack,
@@ -217,7 +216,7 @@ test("copyFiles nonexistent", async () => {
   }).rejects.toThrow(/no such file/);
 });
 
-test("runtime-string", async () => {
+test("runtime: nodejs10.x", async () => {
   const app = await createApp();
   const stack = new Stack(app, "stack");
   new Function(stack, "Function", {
@@ -230,7 +229,22 @@ test("runtime-string", async () => {
   });
 });
 
-test("runtime-string-invalid", async () => {
+test("runtime: container", async () => {
+  const app = await createApp();
+  const stack = new Stack(app, "stack");
+  new Function(stack, "Function", {
+    runtime: "container",
+    handler: "test/constructs/container-function",
+  });
+  await app.finish();
+  hasResource(stack, "AWS::Lambda::Function", {
+    Code: objectLike({
+      ImageUri: ANY,
+    }),
+  });
+});
+
+test("runtime: invalid", async () => {
   const app = await createApp();
   const stack = new Stack(app, "stack");
   new Function(stack, "Function", {
@@ -797,6 +811,41 @@ test("vpc: securityGroups configured without vpc", async () => {
     });
   }).toThrow(/Cannot configure "securityGroups"/);
 });
+
+test("nodejs.install: valid package", async () => {
+  const app = await createApp({
+    mode: "deploy",
+  });
+  const stack = new Stack(app, "stack");
+  new Function(stack, "Function", {
+    handler: "test/constructs/lambda/fn.handler",
+    nodejs: {
+      install: ["lodash"],
+    },
+  });
+  let error = null;
+  try {
+    await app.finish();
+  } catch (e) {
+    error = e;
+  }
+  expect(error).toBe(null);
+});
+
+test("nodejs.install: invalid package", async () => {
+  const app = await createApp({
+    mode: "deploy",
+  });
+  const stack = new Stack(app, "stack");
+  new Function(stack, "Function", {
+    handler: "test/lambda.handler",
+    nodejs: {
+      install: ["packagethatdoesnotexist"],
+    },
+  });
+  await expect(() => app.finish()).rejects.toThrow(/Failed to build function/);
+});
+
 /////////////////////////////
 // Test Constructor for Local Debug
 /////////////////////////////

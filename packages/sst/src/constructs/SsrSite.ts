@@ -83,6 +83,7 @@ import {
   BaseSiteCdkDistributionProps,
   getBuildCmdEnvironment,
 } from "./BaseSite.js";
+import { useDeferredTasks } from "./deferred_task.js";
 import { HttpsRedirect } from "./cdk/website-redirect.js";
 import { DnsValidatedCertificate } from "./cdk/dns-validated-certificate.js";
 import { Size } from "./util/size.js";
@@ -307,12 +308,14 @@ export abstract class SsrSite extends Construct implements SSTConstruct {
   protected props: SsrSiteNormalizedProps;
   protected doNotDeploy: boolean;
   protected buildConfig: SsrBuildConfig;
+  protected deferredTaskCallbacks: (() => void)[] = [];
   private serverLambdaCdkFunctionForEdge?: ICdkFunction;
   protected serverLambdaForEdge?: EdgeFunction;
-  protected serverLambdaForRegional?: CdkFunction;
-  private serverLambdaForDev?: CdkFunction;
+  protected serverLambdaForRegional?: SsrFunction;
+  private serverLambdaForDev?: SsrFunction;
   protected bucket: Bucket;
   private cfFunction: CfFunction;
+  private s3Origin: S3Origin;
   private distribution: Distribution;
   private hostedZone?: IHostedZone;
   private certificate?: ICertificate;
@@ -343,15 +346,10 @@ export abstract class SsrSite extends Construct implements SSTConstruct {
 
     if (this.doNotDeploy) {
       // @ts-ignore
-      this.cfFunction = this.bucket = this.distribution = null;
+      this.cfFunction = this.bucket = this.s3Origin = this.distribution = null;
       this.serverLambdaForDev = this.createFunctionForDev();
       return;
     }
-
-    const cliLayer = new AwsCliLayer(this, "AwsCliLayer");
-
-    // Build app
-    this.buildApp();
 
     // Create Bucket which will be utilised to contain the statics
     this.bucket = this.createS3Bucket();
@@ -377,29 +375,47 @@ export abstract class SsrSite extends Construct implements SSTConstruct {
     this.hostedZone = this.lookupHostedZone();
     this.certificate = this.createCertificate();
 
-    // Create S3 Deployment
-    const assets = this.createS3Assets();
-    const assetFileOptions = this.createS3AssetFileOptions();
-    const s3deployCR = this.createS3Deployment(
-      cliLayer,
-      assets,
-      assetFileOptions
-    );
-
     // Create CloudFront
     this.validateCloudFrontDistributionSettings();
+    this.s3Origin = this.createCloudFrontS3Origin();
     this.cfFunction = this.createCloudFrontFunction();
     this.distribution = this.props.edge
       ? this.createCloudFrontDistributionForEdge()
       : this.createCloudFrontDistributionForRegional();
-    this.distribution.node.addDependency(s3deployCR);
     this.grantServerCloudFrontPermissions();
-
-    // Invalidate CloudFront
-    this.createCloudFrontInvalidation();
 
     // Connect Custom Domain to CloudFront Distribution
     this.createRoute53Records();
+
+    useDeferredTasks().add(async () => {
+      // Build app
+      this.buildApp();
+
+      // Build server functions
+      await this.serverLambdaForEdge?.build();
+      await this.serverLambdaForRegional?.build();
+
+      // Create S3 Deployment
+      const cliLayer = new AwsCliLayer(this, "AwsCliLayer");
+      const assets = this.createS3Assets();
+      const assetFileOptions = this.createS3AssetFileOptions();
+      const s3deployCR = this.createS3Deployment(
+        cliLayer,
+        assets,
+        assetFileOptions
+      );
+      this.distribution.node.addDependency(s3deployCR);
+
+      // Add static file behaviors
+      this.addStaticFileBehaviors();
+
+      // Invalidate CloudFront
+      this.createCloudFrontInvalidation();
+
+      for (const task of this.deferredTaskCallbacks) {
+        await task();
+      }
+    });
   }
 
   /////////////////////
@@ -688,7 +704,11 @@ export abstract class SsrSite extends Construct implements SSTConstruct {
       if (item === this.buildConfig.clientBuildVersionedSubDir) {
         fileOptions.push({
           exclude: "*",
-          include: `${this.buildConfig.clientBuildVersionedSubDir}/*`,
+          include: path.posix.join(
+            this.buildConfig.clientBuildS3KeyPrefix ?? "",
+            this.buildConfig.clientBuildVersionedSubDir,
+            "*"
+          ),
           cacheControl: "public,max-age=31536000,immutable",
         });
       }
@@ -698,9 +718,11 @@ export abstract class SsrSite extends Construct implements SSTConstruct {
         const itemPath = path.join(clientPath, item);
         fileOptions.push({
           exclude: "*",
-          include: fs.statSync(itemPath).isDirectory()
-            ? `${item}/*`
-            : `${item}`,
+          include: path.posix.join(
+            this.buildConfig.clientBuildS3KeyPrefix ?? "",
+            item,
+            fs.statSync(itemPath).isDirectory() ? "*" : ""
+          ),
           cacheControl: "public,max-age=0,s-maxage=31536000,must-revalidate",
         });
       }
@@ -793,15 +815,15 @@ export abstract class SsrSite extends Construct implements SSTConstruct {
   // Bundle Lambda Server
   /////////////////////
 
-  protected createFunctionForRegional(): CdkFunction {
-    return {} as CdkFunction;
+  protected createFunctionForRegional() {
+    return {} as SsrFunction;
   }
 
-  protected createFunctionForEdge(): EdgeFunction {
+  protected createFunctionForEdge() {
     return {} as EdgeFunction;
   }
 
-  protected createFunctionForDev(): CdkFunction {
+  protected createFunctionForDev() {
     const { runtime, timeout, memorySize, permissions, environment, bind } =
       this.props;
 
@@ -828,7 +850,11 @@ export abstract class SsrSite extends Construct implements SSTConstruct {
       // note: do not need to set vpc settings b/c this function is not being used
     });
 
-    return ssrFn.function;
+    useDeferredTasks().add(async () => {
+      await ssrFn.build();
+    });
+
+    return ssrFn;
   }
 
   private grantServerS3Permissions() {
@@ -872,6 +898,12 @@ export abstract class SsrSite extends Construct implements SSTConstruct {
     }
   }
 
+  private createCloudFrontS3Origin() {
+    return new S3Origin(this.bucket, {
+      originPath: "/" + (this.buildConfig.clientBuildS3KeyPrefix ?? ""),
+    });
+  }
+
   private createCloudFrontFunction() {
     return new CfFunction(this, "CloudFrontFunction", {
       code: CfFunctionCode.fromInline(`
@@ -887,7 +919,6 @@ function handler(event) {
   protected createCloudFrontDistributionForRegional(): Distribution {
     const { cdk } = this.props;
     const cfDistributionProps = cdk?.distribution || {};
-    const s3Origin = new S3Origin(this.bucket);
     const cachePolicy = cdk?.serverCachePolicy ?? this.buildServerCachePolicy();
 
     return new Distribution(this, "Distribution", {
@@ -900,7 +931,6 @@ function handler(event) {
       certificate: this.certificate,
       defaultBehavior: this.buildDefaultBehaviorForRegional(cachePolicy),
       additionalBehaviors: {
-        ...this.buildStaticFileBehaviors(s3Origin),
         ...(cfDistributionProps.additionalBehaviors || {}),
       },
     });
@@ -909,7 +939,6 @@ function handler(event) {
   protected createCloudFrontDistributionForEdge(): Distribution {
     const { cdk } = this.props;
     const cfDistributionProps = cdk?.distribution || {};
-    const s3Origin = new S3Origin(this.bucket);
     const cachePolicy = cdk?.serverCachePolicy ?? this.buildServerCachePolicy();
 
     return new Distribution(this, "Distribution", {
@@ -920,9 +949,8 @@ function handler(event) {
       // these values can NOT be overwritten by cfDistributionProps
       domainNames: this.buildDistributionDomainNames(),
       certificate: this.certificate,
-      defaultBehavior: this.buildDefaultBehaviorForEdge(s3Origin, cachePolicy),
+      defaultBehavior: this.buildDefaultBehaviorForEdge(cachePolicy),
       additionalBehaviors: {
-        ...this.buildStaticFileBehaviors(s3Origin),
         ...(cfDistributionProps.additionalBehaviors || {}),
       },
     });
@@ -981,7 +1009,6 @@ function handler(event) {
   }
 
   protected buildDefaultBehaviorForEdge(
-    origin: S3Origin,
     cachePolicy: ICachePolicy
   ): BehaviorOptions {
     const { cdk } = this.props;
@@ -989,7 +1016,7 @@ function handler(event) {
 
     return {
       viewerProtocolPolicy: ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-      origin,
+      origin: this.s3Origin,
       allowedMethods: AllowedMethods.ALLOW_ALL,
       cachedMethods: CachedMethods.CACHE_GET_HEAD_OPTIONS,
       compress: true,
@@ -1021,36 +1048,25 @@ function handler(event) {
     ];
   }
 
-  protected buildStaticFileBehaviors(
-    origin: S3Origin
-  ): Record<string, BehaviorOptions> {
+  protected addStaticFileBehaviors() {
     const { cdk } = this.props;
 
-    // Create additional behaviours for statics
-    const staticBehaviourOptions: BehaviorOptions = {
-      viewerProtocolPolicy: ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-      origin,
-      allowedMethods: AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
-      cachedMethods: CachedMethods.CACHE_GET_HEAD_OPTIONS,
-      compress: true,
-      cachePolicy: CachePolicy.CACHING_OPTIMIZED,
-    };
-
-    // Add behaviour for public folder statics (excluding build)
-    const staticsBehaviours: Record<string, BehaviorOptions> = {};
+    // Create a template for statics behaviours
     const publicDir = path.join(
       this.props.path,
       this.buildConfig.clientBuildOutputDir
     );
     for (const item of fs.readdirSync(publicDir)) {
-      if (fs.statSync(path.join(publicDir, item)).isDirectory()) {
-        staticsBehaviours[`${item}/*`] = staticBehaviourOptions;
-      } else {
-        staticsBehaviours[item] = staticBehaviourOptions;
-      }
+      const isDir = fs.statSync(path.join(publicDir, item)).isDirectory();
+      this.distribution.addBehavior(isDir ? `${item}/*` : item, this.s3Origin, {
+        viewerProtocolPolicy: ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        allowedMethods: AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
+        cachedMethods: CachedMethods.CACHE_GET_HEAD_OPTIONS,
+        compress: true,
+        cachePolicy: CachePolicy.CACHING_OPTIMIZED,
+        responseHeadersPolicy: cdk?.responseHeadersPolicy,
+      });
     }
-
-    return staticsBehaviours;
   }
 
   protected buildServerCachePolicy(allowedHeaders?: string[]) {
@@ -1060,7 +1076,7 @@ function handler(event) {
         allowedHeaders && allowedHeaders.length > 0
           ? CacheHeaderBehavior.allowList(...allowedHeaders)
           : CacheHeaderBehavior.none(),
-      cookieBehavior: CacheCookieBehavior.all(),
+      cookieBehavior: CacheCookieBehavior.none(),
       defaultTtl: CdkDuration.days(0),
       maxTtl: CdkDuration.days(365),
       minTtl: CdkDuration.days(0),
@@ -1333,9 +1349,7 @@ function handler(event) {
   protected generateBuildId(): string {
     // We will generate a hash based on the contents of the "public" folder
     // which will be used to indicate if we need to invalidate our CloudFront
-    // cache. As the browser build files are always uniquely hash in their
-    // filenames according to their content we can ignore the browser build
-    // files.
+    // cache.
 
     // The below options are needed to support following symlinks when building zip files:
     // - nodir: This will prevent symlinks themselves from being copied into the zip.
@@ -1344,7 +1358,6 @@ function handler(event) {
       dot: true,
       nodir: true,
       follow: true,
-      ignore: [`${this.buildConfig.clientBuildVersionedSubDir}/**`],
       cwd: path.resolve(this.props.path, this.buildConfig.clientBuildOutputDir),
     };
     const files = glob.sync("**", globOptions);
